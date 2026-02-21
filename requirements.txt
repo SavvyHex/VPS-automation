@@ -5,6 +5,12 @@ PyQt6>=6.6.0
 selenium>=4.23.0
 playwright>=1.46.0
 
+# Undetectable Chrome (primary bypass driver)
+nodriver>=0.36
+
+# Data handling
+pandas>=2.0.0
+
 # Image Processing
 opencv-python>=4.8.0
 Pillow>=10.0.0

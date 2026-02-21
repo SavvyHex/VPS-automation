@@ -124,7 +124,14 @@ def find_first(driver, selectors: list, timeout: int = 10):
 
 def human_type(el, text: str) -> None:
     """Type text with randomised delays to mimic human speed."""
-    el.click()
+    try:
+        el.click()
+    except Exception:
+        # Overlay may still intercept – fall back to JS click
+        try:
+            el._parent.execute_script("arguments[0].click();", el)
+        except Exception:
+            pass
     el.clear()
     for ch in str(text):
         el.send_keys(ch)
@@ -163,6 +170,23 @@ def wait_cf_pass(driver, timeout_s: int = 60) -> bool:
     return False
 
 
+def _nuke_cookie_overlay(driver) -> None:
+    """Force-remove OneTrust overlay elements via JS if they are still present."""
+    driver.execute_script("""
+        var selectors = [
+            '.onetrust-pc-dark-filter',
+            '#onetrust-banner-sdk',
+            '#onetrust-consent-sdk',
+            '.ot-fade-in'
+        ];
+        selectors.forEach(function(sel) {
+            var els = document.querySelectorAll(sel);
+            els.forEach(function(el) { el.remove(); });
+        });
+        document.body.style.overflow = '';
+    """)
+
+
 def dismiss_cookie_banner(driver) -> None:
     for sel in [
         "#onetrust-accept-btn-handler",
@@ -171,22 +195,31 @@ def dismiss_cookie_banner(driver) -> None:
         try:
             btn = driver.find_element(By.CSS_SELECTOR, sel)
             if btn.is_displayed():
-                btn.click()
-                time.sleep(0.5)
+                driver.execute_script("arguments[0].click();", btn)
                 log.info("Cookie banner dismissed.")
-                return
+                break
         except Exception:
             pass
-    # XPath text matches
-    for text in ["Accept All", "Accept Cookies", "Accept"]:
-        try:
-            btn = driver.find_element(By.XPATH, f"//button[contains(.,'{text}')]")
-            if btn.is_displayed():
-                btn.click()
-                time.sleep(0.5)
-                return
-        except Exception:
-            pass
+    else:
+        # XPath text matches
+        for text in ["Accept All", "Accept Cookies", "Accept"]:
+            try:
+                btn = driver.find_element(By.XPATH, f"//button[contains(.,'{text}')]")
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", btn)
+                    break
+            except Exception:
+                pass
+
+    # Wait up to 5 s for the dark filter overlay to disappear, then nuke if still present
+    try:
+        WebDriverWait(driver, 5).until(
+            EC.invisibility_of_element_located((By.CSS_SELECTOR, ".onetrust-pc-dark-filter"))
+        )
+    except Exception:
+        _nuke_cookie_overlay(driver)
+        log.info("Cookie overlay force-removed via JS.")
+    time.sleep(0.3)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -313,6 +346,14 @@ def do_login(driver, email: str, password: str) -> bool:
         time.sleep(random.uniform(4, 6))
 
     dismiss_cookie_banner(driver)
+
+    # Ensure no overlay is blocking interaction before we touch any input
+    try:
+        WebDriverWait(driver, 6).until(
+            EC.invisibility_of_element_located((By.CSS_SELECTOR, ".onetrust-pc-dark-filter"))
+        )
+    except Exception:
+        _nuke_cookie_overlay(driver)
 
     # Wait for Angular to render the login form
     email_el = find_first(driver, [
