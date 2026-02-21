@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 
 # Add the app directory to the path
-sys.path.append(str(Path(__file__).parent / "app"))
+sys.path.append(str(Path(__file__).parent.parent / "app"))
 
 from services.vfs_automation import VFSAutomation, AvailabilityStatus, BookingResult
 from services.csv_io import ClientRecord, load_clients

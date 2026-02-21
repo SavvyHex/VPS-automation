@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 # Add the app directory to the path
-sys.path.append(str(Path(__file__).parent / "app"))
+sys.path.append(str(Path(__file__).parent.parent / "app"))
 
 from services.vfs_automation import VFSAutomation
 

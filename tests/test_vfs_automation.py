@@ -5,7 +5,7 @@ Test script for VFS automation functionality
 
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), 'app'))
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'app'))
 
 from services.vfs_automation import VFSAutomation, AvailabilityStatus
 from services.csv_io import ClientRecord

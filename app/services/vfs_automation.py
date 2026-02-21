@@ -94,10 +94,10 @@ class VFSAutomation:
         self.playwright = None
         self.driver = None
         
-        # VFS Guinea-Bissau URLs (default to Guinea‑Bissau / Portuguese / Portugal)
+        # VFS Guinea-Bissau URLs – English portal (gnb/en/prt)
         self.base_url = "https://visa.vfsglobal.com"
-        self.booking_url = "https://visa.vfsglobal.com/gnb/pt/prt/book-appointment"
-        self.login_url = "https://visa.vfsglobal.com/gnb/pt/prt/login"
+        self.booking_url = "https://visa.vfsglobal.com/gnb/en/prt/book-appointment"
+        self.login_url = "https://visa.vfsglobal.com/gnb/en/prt/login"
         
         # Enhanced rate limiting settings
         self.min_delay = 3
@@ -1645,7 +1645,166 @@ class VFSAutomation:
             
         except Exception as e:
             self.logger.error(f"Error stopping browser: {str(e)}")
-            
+
+    # ------------------------------------------------------------------
+    # Login to VFS Global
+    # ------------------------------------------------------------------
+    def login(self, email: str, password: str) -> bool:
+        """
+        Log in to the VFS Global English portal.
+        Must be called after start_browser().
+        Returns True on success.
+        """
+        self.logger.info(f"Logging in as {email}")
+        try:
+            if self.use_playwright and self.page:
+                self.page.goto(self.login_url, wait_until="networkidle", timeout=30_000)
+                import time as _time; _time.sleep(random.uniform(1.5, 3))
+
+                # Accept cookie consent if present
+                for cookie_sel in [
+                    "#onetrust-accept-btn-handler",
+                    "button:has-text('Accept All')",
+                    "button:has-text('Accept')",
+                ]:
+                    try:
+                        btn = self.page.locator(cookie_sel).first
+                        if btn.is_visible(timeout=1_500):
+                            btn.click()
+                            _time.sleep(0.5)
+                            break
+                    except Exception:
+                        pass
+
+                # Locate email field
+                email_el = None
+                for sel in [
+                    'input[formcontrolname="email"]',
+                    'input[formcontrolname="username"]',
+                    'input[name="email"]',
+                    'input[type="email"]',
+                    'input[placeholder*="Email" i]',
+                    '#mat-input-0',
+                ]:
+                    try:
+                        el = self.page.locator(sel).first
+                        if el.is_visible(timeout=2_000):
+                            email_el = el
+                            break
+                    except Exception:
+                        pass
+                if not email_el:
+                    self.logger.error("Login: email field not found.")
+                    return False
+
+                email_el.click()
+                email_el.fill("")
+                for ch in email:
+                    email_el.type(ch, delay=random.randint(50, 120))
+                _time.sleep(random.uniform(0.3, 0.8))
+
+                # Locate password field
+                pwd_el = None
+                for sel in [
+                    'input[formcontrolname="password"]',
+                    'input[name="password"]',
+                    'input[type="password"]',
+                    '#mat-input-1',
+                ]:
+                    try:
+                        el = self.page.locator(sel).first
+                        if el.is_visible(timeout=2_000):
+                            pwd_el = el
+                            break
+                    except Exception:
+                        pass
+                if not pwd_el:
+                    self.logger.error("Login: password field not found.")
+                    return False
+
+                pwd_el.click()
+                pwd_el.fill("")
+                for ch in password:
+                    pwd_el.type(ch, delay=random.randint(50, 120))
+                _time.sleep(random.uniform(0.5, 1.2))
+
+                # Click submit
+                submitted = False
+                for sel in [
+                    'button[type="submit"]',
+                    'button:has-text("Sign In")',
+                    'button:has-text("Log In")',
+                    'button:has-text("Login")',
+                    '.sign-in-btn',
+                ]:
+                    try:
+                        btn = self.page.locator(sel).first
+                        if btn.is_visible(timeout=2_000) and btn.is_enabled():
+                            btn.click()
+                            submitted = True
+                            break
+                    except Exception:
+                        pass
+                if not submitted:
+                    pwd_el.press("Enter")
+
+                _time.sleep(random.uniform(3, 6))
+
+                current_url = self.page.url
+                if "/login" not in current_url:
+                    self.logger.info(f"Login successful. URL: {current_url}")
+                    return True
+
+                # Check for error text on page
+                for err_sel in [".error-message", ".mat-error", "mat-error", "[role='alert']"]:
+                    try:
+                        el = self.page.locator(err_sel).first
+                        if el.is_visible(timeout=1_000):
+                            self.logger.error(f"Login error: {el.text_content().strip()}")
+                            return False
+                    except Exception:
+                        pass
+
+                _time.sleep(random.uniform(3, 5))
+                if "/login" not in self.page.url:
+                    self.logger.info("Login successful (delayed navigation).")
+                    return True
+
+                self.logger.error(f"Login failed – still on login page: {self.page.url}")
+                return False
+
+            elif self.driver:
+                # Selenium fallback login
+                from selenium.webdriver.common.by import By as _By
+                from selenium.webdriver.support.ui import WebDriverWait as _WDW
+                from selenium.webdriver.support import expected_conditions as _EC
+                self.driver.get(self.login_url)
+                import time as _time; _time.sleep(3)
+                for sel in ['input[name="email"]', 'input[type="email"]', '#email']:
+                    try:
+                        el = self.driver.find_element(_By.CSS_SELECTOR, sel)
+                        el.clear(); el.send_keys(email)
+                        break
+                    except Exception:
+                        pass
+                for sel in ['input[name="password"]', 'input[type="password"]', '#password']:
+                    try:
+                        el = self.driver.find_element(_By.CSS_SELECTOR, sel)
+                        el.clear(); el.send_keys(password)
+                        break
+                    except Exception:
+                        pass
+                try:
+                    self.driver.find_element(_By.CSS_SELECTOR, 'button[type="submit"]').click()
+                except Exception:
+                    pass
+                _time.sleep(4)
+                return "/login" not in self.driver.current_url
+
+        except Exception as exc:
+            self.logger.error(f"login() raised: {exc}")
+        return False
+
     def check_availability(self, duration_minutes: int = 4) -> AvailabilityStatus:
         """Monitor website for availability with enhanced safety and rate limiting."""
         self.logger.info(f"Starting enhanced availability monitoring for {duration_minutes} minutes")
@@ -2321,7 +2480,9 @@ if QtCore is not None:
         error_occurred = QtCore.pyqtSignal(str)
         progress_updated = QtCore.pyqtSignal(int, int)  # current, total
         
-        def __init__(self, headless: bool = True, use_playwright: bool = True, start_url: Optional[str] = None):
+        def __init__(self, headless: bool = True, use_playwright: bool = True,
+                     start_url: Optional[str] = None,
+                     login_email: str = "", login_password: str = ""):
             super().__init__()
             self.headless = headless
             self.use_playwright = use_playwright
@@ -2330,6 +2491,8 @@ if QtCore is not None:
             self.max_clients = 5
             self._stop_requested = False
             self.start_url = start_url
+            self.login_email    = login_email
+            self.login_password = login_password
         
         def run(self) -> None:
             """Main worker thread execution."""
@@ -2359,6 +2522,14 @@ if QtCore is not None:
                 if not self.vfs_automation.start_browser():
                     self.error_occurred.emit("Failed to start browser")
                     return
+
+                # Login if credentials supplied
+                if self.login_email and self.login_password:
+                    self.status_updated.emit("Logging in to VFS Global...")
+                    if not self.vfs_automation.login(self.login_email, self.login_password):
+                        self.error_occurred.emit("Login failed – check credentials.")
+                        return
+                    self.status_updated.emit("Login successful.")
                     
                 self.status_updated.emit("Browser started. Monitoring for availability...")
                 
@@ -2407,7 +2578,9 @@ else:
     class VFSBotWorker:
         """Fallback worker for VFS automation when PyQt6 is not available."""
         
-        def __init__(self, headless: bool = True, use_playwright: bool = True, start_url: Optional[str] = None):
+        def __init__(self, headless: bool = True, use_playwright: bool = True,
+                     start_url: Optional[str] = None,
+                     login_email: str = "", login_password: str = ""):
             self.headless = headless
             self.use_playwright = use_playwright
             self.vfs_automation = None
@@ -2415,12 +2588,14 @@ else:
             self.max_clients = 5
             self._stop_requested = False
             self.start_url = start_url
+            self.login_email    = login_email
+            self.login_password = login_password
             # Dummy signal methods
-            self.status_updated = lambda x: None
+            self.status_updated    = lambda x: None
             self.availability_found = lambda x: None
-            self.booking_completed = lambda x: None
-            self.error_occurred = lambda x: None
-            self.progress_updated = lambda x, y: None
+            self.booking_completed  = lambda x: None
+            self.error_occurred     = lambda x: None
+            self.progress_updated   = lambda x, y: None
         
         def run(self) -> None:
             """Main worker execution (fallback)."""
@@ -2447,6 +2622,14 @@ else:
                 if not self.vfs_automation.start_browser():
                     self.error_occurred("Failed to start browser")
                     return
+
+                # Login if credentials supplied
+                if self.login_email and self.login_password:
+                    self.status_updated("Logging in to VFS Global...")
+                    if not self.vfs_automation.login(self.login_email, self.login_password):
+                        self.error_occurred("Login failed – check credentials.")
+                        return
+                    self.status_updated("Login successful.")
                     
                 self.status_updated("Browser started. Monitoring for availability...")
                 
