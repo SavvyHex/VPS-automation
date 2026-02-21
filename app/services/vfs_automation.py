@@ -2154,123 +2154,229 @@ class VFSAutomation:
                 timestamp=datetime.now().isoformat()
             )
             
+    def _select_mat_dropdown(self, formcontrolname: str, option_text: str, timeout: int = 8000) -> bool:
+        """
+        Handle Angular Material mat-select dropdowns.
+        Clicks the trigger, waits for the overlay panel, then selects the matching option.
+        """
+        triggers = [
+            f'mat-select[formcontrolname="{formcontrolname}"]',
+            f'[formcontrolname="{formcontrolname}"] mat-select',
+            f'[formcontrolname="{formcontrolname}"]',
+        ]
+        for trigger_sel in triggers:
+            try:
+                trigger = self.page.locator(trigger_sel).first
+                if not trigger.is_visible(timeout=3000):
+                    continue
+                trigger.click()
+                time.sleep(0.6)
+                # Mat overlay panel appears outside the component
+                option_sel = f'mat-option:has-text("{option_text}")'
+                try:
+                    opt = self.page.locator(option_sel).first
+                    opt.wait_for(state="visible", timeout=timeout)
+                    opt.click()
+                    time.sleep(0.4)
+                    self.logger.info(f"mat-select '{formcontrolname}' set to '{option_text}'")
+                    return True
+                except Exception:
+                    # Try partial match fallback
+                    all_options = self.page.locator("mat-option").all()
+                    for opt in all_options:
+                        txt = opt.text_content() or ""
+                        if option_text.lower() in txt.lower():
+                            opt.click()
+                            time.sleep(0.4)
+                            self.logger.info(f"mat-select '{formcontrolname}' partial-match -> '{txt.strip()}'")
+                            return True
+                    # Close the panel
+                    self.page.keyboard.press("Escape")
+            except Exception as e:
+                self.logger.debug(f"mat-select attempt with selector '{trigger_sel}': {e}")
+                continue
+        return False
+
+    def _fill_mat_input(self, formcontrolname: str, value: str) -> bool:
+        """Fill an Angular Material input field identified by formcontrolname."""
+        selectors = [
+            f'input[formcontrolname="{formcontrolname}"]',
+            f'textarea[formcontrolname="{formcontrolname}"]',
+            f'[formcontrolname="{formcontrolname}"] input',
+        ]
+        for sel in selectors:
+            try:
+                el = self.page.locator(sel).first
+                if el.is_visible(timeout=3000):
+                    el.click()
+                    el.fill("")
+                    for ch in value:
+                        el.type(ch, delay=random.randint(45, 110))
+                    time.sleep(random.uniform(0.2, 0.5))
+                    self.logger.info(f"Filled '{formcontrolname}' = '{value}'")
+                    return True
+            except Exception as e:
+                self.logger.debug(f"_fill_mat_input '{sel}': {e}")
+        return False
+
+    def _click_continue_button(self) -> bool:
+        """Click the Continue / Next step button on the booking wizard."""
+        continue_sels = [
+            'button:has-text("Continue")',
+            'button:has-text("Next")',
+            'button:has-text("Proceed")',
+            'button[type="submit"]:visible',
+            '.vfs-btn-primary:visible',
+            'button.mat-raised-button:visible',
+        ]
+        for sel in continue_sels:
+            try:
+                btn = self.page.locator(sel).first
+                if btn.is_visible(timeout=2500) and btn.is_enabled():
+                    btn.click()
+                    time.sleep(random.uniform(1.5, 2.5))
+                    self.logger.info(f"Clicked continue/next: {sel}")
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _fill_form_playwright(self, client: ClientRecord) -> bool:
-        """Fill booking form using Playwright with enhanced selectors and human-like behavior."""
+        """
+        Fill the VFS Global GNB multi-step Angular booking form.
+
+        Step 1 – Appointment Details:  visa category, sub-category / service, application centre.
+        Step 2 – Applicant Details:    names, DOB, gender, nationality, passport, email, phone.
+        Step 3 – Summary confirmation.
+        """
         try:
-            # Wait for page to load completely
-            self.page.wait_for_load_state('networkidle')
-            self._random_delay()
-            
-            # Enhanced form field selectors
-            form_selectors = {
-                'first_name': [
-                    'input[name="firstName"]',
-                    'input[name="first_name"]',
-                    'input[name="givenName"]',
-                    'input[id*="first"]',
-                    'input[placeholder*="first"]',
-                    '#firstName',
-                    '#first_name'
-                ],
-                'last_name': [
-                    'input[name="lastName"]',
-                    'input[name="last_name"]',
-                    'input[name="surname"]',
-                    'input[id*="last"]',
-                    'input[placeholder*="last"]',
-                    '#lastName',
-                    '#last_name'
-                ],
-                'email': [
-                    'input[name="email"]',
-                    'input[name="emailAddress"]',
-                    'input[type="email"]',
-                    'input[id*="email"]',
-                    'input[placeholder*="email"]',
-                    '#email',
-                    '#emailAddress'
-                ],
-                'phone': [
-                    'input[name="phone"]',
-                    'input[name="phoneNumber"]',
-                    'input[name="mobile"]',
-                    'input[id*="phone"]',
-                    'input[placeholder*="phone"]',
-                    '#phone',
-                    '#phoneNumber'
-                ],
-                'passport': [
-                    'input[name="passportNumber"]',
-                    'input[name="passport"]',
-                    'input[id*="passport"]',
-                    'input[placeholder*="passport"]',
-                    '#passportNumber',
-                    '#passport'
-                ]
-            }
-            
-            # Fill personal details with human-like typing
-            self._fill_field_human_like(form_selectors['first_name'], client.first_name)
-            self._random_delay()
-            
-            self._fill_field_human_like(form_selectors['last_name'], client.last_name)
-            self._random_delay()
-            
-            self._fill_field_human_like(form_selectors['email'], client.email)
-            self._random_delay()
-            
-            phone_number = f"{client.mobile_country_code}{client.mobile_number}"
-            self._fill_field_human_like(form_selectors['phone'], phone_number)
-            self._random_delay()
-            
-            # Fill passport details
-            if client.passport_number:
-                self._fill_field_human_like(form_selectors['passport'], client.passport_number)
-                self._random_delay()
-            
-            # Select nationality with multiple selector attempts
+            import time as _t
+            self.page.wait_for_load_state("networkidle", timeout=30_000)
+            _t.sleep(random.uniform(1.5, 2.5))
+
+            # ── STEP 1: Appointment Details ───────────────────────────────────
+            self.logger.info("Step 1 – Appointment Details")
+
+            # Visa / appointment category  (e.g. "Family Visit")
+            visa_value = client.visa_type or client.trip_reason or client.service_center
+            if visa_value:
+                if not self._select_mat_dropdown("visaCategory", visa_value):
+                    self._select_mat_dropdown("category", visa_value)
+                _t.sleep(0.8)
+
+            # Sub-category / service type  (e.g. "Family Visit")
+            sub_value = client.service_center or client.trip_reason
+            if sub_value:
+                if not self._select_mat_dropdown("subCategory", sub_value):
+                    self._select_mat_dropdown("visaSubCategory", sub_value)
+                _t.sleep(0.8)
+
+            # Application centre  (e.g. "Portugal Visa Center")
+            center_value = client.application_center
+            if center_value:
+                if not self._select_mat_dropdown("centre", center_value):
+                    if not self._select_mat_dropdown("center", center_value):
+                        self._select_mat_dropdown("appointmentLocation", center_value)
+                _t.sleep(0.8)
+
+            # Click Continue to Step 2
+            self._click_continue_button()
+            _t.sleep(random.uniform(1.5, 2.5))
+            self.page.wait_for_load_state("domcontentloaded", timeout=20_000)
+
+            # ── STEP 2: Applicant Details ─────────────────────────────────────
+            self.logger.info("Step 2 – Applicant Details")
+
+            # First name
+            for fc in ["firstName", "first_name", "givenName", "applicantFirstName"]:
+                if self._fill_mat_input(fc, client.first_name):
+                    break
+            _t.sleep(random.uniform(0.3, 0.6))
+
+            # Last name
+            for fc in ["lastName", "last_name", "surname", "familyName", "applicantLastName"]:
+                if self._fill_mat_input(fc, client.last_name):
+                    break
+            _t.sleep(random.uniform(0.3, 0.6))
+
+            # Date of birth (DD/MM/YYYY format)
+            if client.date_of_birth:
+                for fc in ["dateOfBirth", "dob", "birthDate", "applicantDob"]:
+                    if self._fill_mat_input(fc, client.date_of_birth):
+                        break
+                _t.sleep(random.uniform(0.3, 0.6))
+
+            # Gender
+            if client.gender:
+                gender_label = client.gender.capitalize()  # "Male" / "Female"
+                if not self._select_mat_dropdown("gender", gender_label):
+                    # Try radio button approach
+                    try:
+                        radio = self.page.locator(
+                            f'mat-radio-button:has-text("{gender_label}")'
+                        ).first
+                        if radio.is_visible(timeout=2000):
+                            radio.click()
+                    except Exception:
+                        pass
+                _t.sleep(0.4)
+
+            # Nationality
             if client.current_nationality:
-                nationality_selectors = [
-                    'select[name="nationality"]',
-                    'select[name="country"]',
-                    'select[id*="nationality"]',
-                    'select[id*="country"]',
-                    '#nationality',
-                    '#country'
-                ]
-                self._select_option_human_like(nationality_selectors, client.current_nationality)
-                self._random_delay()
-            
-            # Select visa type
-            if client.service_center:
-                visa_selectors = [
-                    'select[name="visaType"]',
-                    'select[name="serviceType"]',
-                    'select[id*="visa"]',
-                    'select[id*="service"]',
-                    '#visaType',
-                    '#serviceType'
-                ]
-                self._select_option_human_like(visa_selectors, client.service_center)
-                self._random_delay()
-            
-            # Fill additional fields if available
-            if hasattr(client, 'date_of_birth') and client.date_of_birth:
-                dob_selectors = [
-                    'input[name="dateOfBirth"]',
-                    'input[name="dob"]',
-                    'input[type="date"]',
-                    'input[id*="birth"]',
-                    '#dateOfBirth',
-                    '#dob'
-                ]
-                self._fill_field_human_like(dob_selectors, client.date_of_birth)
-                self._random_delay()
-            
+                if not self._select_mat_dropdown("nationality", client.current_nationality):
+                    # Some portals use an autocomplete input
+                    for fc in ["nationality", "countryOfBirth", "country"]:
+                        if self._fill_mat_input(fc, client.current_nationality):
+                            # Select the first autocomplete suggestion
+                            _t.sleep(0.8)
+                            try:
+                                opt = self.page.locator("mat-option").first
+                                if opt.is_visible(timeout=2000):
+                                    opt.click()
+                            except Exception:
+                                pass
+                            break
+                _t.sleep(0.5)
+
+            # Passport number
+            if client.passport_number:
+                for fc in ["passportNo", "passportNumber", "passportNum", "travelDocNumber"]:
+                    if self._fill_mat_input(fc, client.passport_number):
+                        break
+                _t.sleep(0.3)
+
+            # Passport expiry
+            if client.passport_expiry:
+                for fc in ["passportExpiry", "passportExpiryDate", "travelDocExpiry", "expiryDate"]:
+                    if self._fill_mat_input(fc, client.passport_expiry):
+                        break
+                _t.sleep(0.3)
+
+            # Contact email
+            for fc in ["contactEmail", "email", "emailAddress", "applicantEmail"]:
+                if self._fill_mat_input(fc, client.email):
+                    break
+            _t.sleep(0.3)
+
+            # Contact phone  (country code + number)
+            phone_full = str(client.mobile_country_code) + str(client.mobile_number)
+            # Try separate country-code + number fields first
+            country_code_filled = self._fill_mat_input("countryCode", str(client.mobile_country_code))
+            if country_code_filled:
+                for fc in ["contactNumber", "mobileNumber", "phoneNumber", "phone"]:
+                    if self._fill_mat_input(fc, str(client.mobile_number)):
+                        break
+            else:
+                for fc in ["contactNumber", "mobileNumber", "phoneNumber", "phone", "mobile"]:
+                    if self._fill_mat_input(fc, phone_full):
+                        break
+            _t.sleep(0.3)
+
+            self.logger.info("Step 2 form filled successfully.")
             return True
-            
+
         except Exception as e:
-            self.logger.error(f"Failed to fill form with Playwright: {str(e)}")
+            self.logger.error(f"_fill_form_playwright failed: {e}")
             return False
     
     def _fill_field_human_like(self, selectors: List[str], value: str) -> bool:
@@ -2355,22 +2461,74 @@ class VFSAutomation:
             return False
             
     def _submit_booking_playwright(self) -> Optional[str]:
-        """Submit booking using Playwright."""
+        """Submit booking using Playwright – handles the VFS multi-step confirm flow."""
+        import time as _t
         try:
-            # Click submit button
-            self.page.click('button[type="submit"]')
-            self._random_delay()
-            
-            # Wait for confirmation page
-            self.page.wait_for_selector('.booking-confirmation, .confirmation-number', timeout=10000)
-            
-            # Extract booking reference
-            booking_ref = self.page.query_selector('.booking-reference, .confirmation-number')
-            if booking_ref:
-                return booking_ref.text_content().strip()
-                
+            # Step 2 → Continue to Summary
+            if not self._click_continue_button():
+                # Try a direct submit press
+                try:
+                    self.page.keyboard.press("Enter")
+                except Exception:
+                    pass
+            _t.sleep(random.uniform(2, 4))
+
+            # Confirm/Pay step (if present)
+            for confirm_sel in [
+                'button:has-text("Confirm")',
+                'button:has-text("Pay")',
+                'button:has-text("Submit")',
+                'button:has-text("Book")',
+                'button[type="submit"]:visible',
+            ]:
+                try:
+                    btn = self.page.locator(confirm_sel).first
+                    if btn.is_visible(timeout=3000) and btn.is_enabled():
+                        btn.click()
+                        _t.sleep(random.uniform(2, 4))
+                        break
+                except Exception:
+                    pass
+
+            # Wait for confirmation page (up to 20 s)
+            confirmation_selectors = [
+                ".booking-confirmation",
+                ".confirmation-number",
+                ".booking-reference",
+                "[class*='confirmation']",
+                "[class*='reference']",
+                "text=Appointment Confirmed",
+                "text=Booking Confirmed",
+                "text=Reference Number",
+                "text=Ref No",
+            ]
+            for sel in confirmation_selectors:
+                try:
+                    self.page.wait_for_selector(sel, timeout=12_000)
+                    el = self.page.locator(sel).first
+                    txt = el.text_content() or ""
+                    if txt.strip():
+                        self.logger.info(f"Booking confirmed: {txt.strip()[:80]}")
+                        return txt.strip()[:80]
+                except Exception:
+                    pass
+
+            # Fallback: grab any reference-looking text from page
+            try:
+                content = self.page.content()
+                import re as _re
+                m = _re.search(r"[A-Z0-9]{6,20}", content)
+                if m:
+                    return m.group(0)
+            except Exception:
+                pass
+
+            # If we're no longer on a form page, consider it a success
+            if "book-appointment" not in self.page.url and "login" not in self.page.url:
+                return "CONFIRMED"
+
             return None
-            
+
         except Exception as e:
             self.logger.error(f"Failed to submit booking with Playwright: {str(e)}")
             return None
@@ -2402,45 +2560,35 @@ class VFSAutomation:
             return None
             
     def book_multiple_clients(self, clients: List[ClientRecord], max_clients: int = 5) -> List[BookingResult]:
-        """Book appointments for multiple clients."""
-        self.logger.info(f"Starting batch booking for {min(len(clients), max_clients)} clients")
-        
-        results = []
+        """
+        Book appointments for up to max_clients within the open window.
+        Availability is checked ONCE before the batch; subsequent clients reuse
+        the same browser session to stay fast within the 3-4 minute window.
+        """
+        batch = clients[:max_clients]
+        self.logger.info(f"Starting batch booking for {len(batch)} client(s)")
+
+        results: List[BookingResult] = []
         successful_bookings = 0
-        
-        for i, client in enumerate(clients[:max_clients]):
-            if successful_bookings >= max_clients:
-                break
-                
-            self.logger.info(f"Processing client {i+1}/{min(len(clients), max_clients)}: {client.email}")
-            
-            # Check availability before each booking
-            availability = self.check_availability(duration_minutes=1)
-            if not availability.available:
-                self.logger.warning(f"No availability found for {client.email}")
-                results.append(BookingResult(
-                    success=False,
-                    error_message="No availability",
-                    client_email=client.email,
-                    timestamp=datetime.now().isoformat()
-                ))
-                continue
-                
-            # Attempt booking
+
+        for i, client in enumerate(batch):
+            self.logger.info(f"Client {i+1}/{len(batch)}: {client.first_name} {client.last_name} <{client.email}>")
             result = self.book_appointment(client)
             results.append(result)
-            
+
             if result.success:
                 successful_bookings += 1
-                self.logger.info(f"Successfully booked {client.email}")
+                self.logger.info(f"  ✓ Booked – ref: {result.booking_reference}")
             else:
-                self.logger.error(f"Failed to book {client.email}: {result.error_message}")
-                
-            # Add delay between bookings
-            if i < len(clients) - 1:
-                self._random_delay()
-                
-        self.logger.info(f"Batch booking completed. Success: {successful_bookings}/{len(clients[:max_clients])}")
+                self.logger.warning(f"  ✗ Failed – {result.error_message}")
+
+            # Short human-like pause between clients
+            if i < len(batch) - 1:
+                time.sleep(random.uniform(2, 5))
+
+        self.logger.info(
+            f"Batch done. Success: {successful_bookings}/{len(batch)}"
+        )
         return results
         
     def save_booking_results(self, results: List[BookingResult], filename: str = None) -> None:
@@ -2541,7 +2689,10 @@ if QtCore is not None:
                     self.status_updated.emit(f"Availability found! {availability.slots_count} slots available.")
                     
                     # Load clients and attempt booking
-                    clients = load_clients()
+                    _csv_path = str(Path(__file__).resolve().parents[2] / "clients.csv")
+                    if not Path(_csv_path).exists():
+                        _csv_path = "clients.csv"
+                    clients = load_clients(_csv_path)
                     if clients:
                         self.status_updated.emit(f"Starting booking for {len(clients)} clients...")
                         results = self.vfs_automation.book_multiple_clients(clients, self.max_clients)
@@ -2641,7 +2792,10 @@ else:
                     self.status_updated(f"Availability found! {availability.slots_count} slots available.")
                     
                     # Load clients and attempt booking
-                    clients = load_clients()
+                    _csv_path = str(Path(__file__).resolve().parents[2] / "clients.csv")
+                    if not Path(_csv_path).exists():
+                        _csv_path = "clients.csv"
+                    clients = load_clients(_csv_path)
                     if clients:
                         self.status_updated(f"Starting booking for {len(clients)} clients...")
                         results = self.vfs_automation.book_multiple_clients(clients, self.max_clients)

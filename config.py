@@ -24,11 +24,14 @@ for directory in [DATA_DIR, LOGS_DIR, DOCS_DIR, INFO_DIR, TEMPLATES_DIR, STATIC_
 # VFS Global Configuration
 VFS_CONFIG = {
     "base_url": "https://visa.vfsglobal.com",
-    "booking_url": "https://visa.vfsglobal.com/gnb/pt/prt/book-appointment",
-    "login_url": "https://visa.vfsglobal.com/gnb/pt/prt/login",
+    "booking_url": "https://visa.vfsglobal.com/gnb/en/prt/book-appointment",
+    "login_url": "https://visa.vfsglobal.com/gnb/en/prt/login",
     "monitoring_duration": 4,  # minutes
     "max_clients_per_session": 5,
-    "check_interval": 30,  # seconds between checks
+    "check_interval": 15,  # seconds between checks
+    "clients_csv": str(BASE_DIR / "clients.csv"),
+    "login_email": "brunovfs2k@gmail.com",
+    "login_password": "Bissau300@",
 }
 
 # Browser Configuration
