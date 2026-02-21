@@ -2,8 +2,9 @@
 """
 VFS Global Guinea-Bissau → Portugal  ·  Unified Multi-Client Booking Bot
 =========================================================================
-Uses nodriver (undetectable Chrome) to bypass Cloudflare and automates
+Uses undetected-chromedriver (UC) to bypass Cloudflare and automates
 the full 5-step VFS booking flow for every row in clients.csv.
+Multiple clients are booked in parallel — each in its own Chrome window.
 
 FIRST RUN  ── warm the session so Cloudflare cookies are saved:
     python unified_booking.py --warmup
@@ -28,20 +29,38 @@ CLIENTS CSV columns (see clients.csv):
 from __future__ import annotations
 
 import argparse
-import asyncio
 import csv
 import glob
 import logging
 import os
+import random
 import shutil
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import nodriver as uc
 import pandas as pd
+
+try:
+    import undetected_chromedriver as uc
+except ImportError:
+    print("ERROR: undetected-chromedriver not installed.")
+    print("       Run:  pip install undetected-chromedriver selenium")
+    sys.exit(1)
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    TimeoutException,
+    ElementNotInteractableException,
+    StaleElementReferenceException,
+)
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -196,34 +215,54 @@ def _norm_code(code: str) -> str:
     return ("+" + code) if code and not code.startswith("+") else code
 
 
-async def _wait(tab, selectors, timeout: float = ELEMENT_WAIT):
-    """Wait until any of the given CSS selectors is present; return (el, sel)."""
+def _wait(driver, selectors, timeout: float = ELEMENT_WAIT):
+    """Wait until any of the given CSS selectors is visible; return (el, sel)."""
     if isinstance(selectors, str):
         selectors = [selectors]
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for sel in selectors:
             try:
-                el = await tab.find(sel, timeout=0.5)
-                if el:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                if el.is_displayed():
                     return el, sel
             except Exception:
                 pass
-        await asyncio.sleep(0.15)
+        time.sleep(0.15)
     return None, None
 
 
-async def _wait_cf(tab) -> bool:
+def _wait_xpath(driver, xpaths, timeout: float = ELEMENT_WAIT):
+    """Wait until any XPath expression matches a visible element; return (el, xpath)."""
+    if isinstance(xpaths, str):
+        xpaths = [xpaths]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for xp in xpaths:
+            try:
+                el = driver.find_element(By.XPATH, xp)
+                if el.is_displayed():
+                    return el, xp
+            except Exception:
+                pass
+        time.sleep(0.15)
+    return None, None
+
+
+def _wait_cf(driver) -> bool:
     """Block until Cloudflare challenge clears (or timeout)."""
     log.info("  [CF] Watching for Cloudflare challenge (max %ds)…", CF_POLL_MAX)
     deadline = time.monotonic() + CF_POLL_MAX
     while time.monotonic() < deadline:
-        await asyncio.sleep(0.8)
+        time.sleep(0.8)
         try:
-            title = (await tab.get_title() or "").lower()
-            url   = await tab.evaluate("window.location.href")
-            if "just a moment" not in title and "checking your browser" not in title:
-                log.info("  [CF] Clear — URL: %s", url)
+            title = (driver.title or "").lower()
+            src   = driver.page_source.lower()
+            if ("just a moment" not in title
+                    and "checking your browser" not in title
+                    and "ddos-guard" not in src
+                    and "cf-browser-verification" not in src):
+                log.info("  [CF] Clear — URL: %s", driver.current_url)
                 return True
         except Exception:
             pass
@@ -231,7 +270,7 @@ async def _wait_cf(tab) -> bool:
     return False
 
 
-async def _js_fill(tab, selector: str | list, value: str, label: str = "") -> bool:
+def _js_fill(driver, selector, value: str, label: str = "") -> bool:
     """Fill an Angular <input> via JS native setter so reactive forms pick it up."""
     if not value:
         return False
@@ -240,33 +279,40 @@ async def _js_fill(tab, selector: str | list, value: str, label: str = "") -> bo
     else:
         sels = [selector]
 
-    el, matched = await _wait(tab, sels)
+    el, matched = _wait(driver, sels)
     if not el:
         log.warning("  [warn] field not found: %s", label or sels)
         return False
     try:
-        ok = await tab.evaluate(
-            f"""(function(){{
-                var s = {repr(matched if matched else sels[0])};
-                var el = document.querySelector(s);
-                if (!el) return false;
-                var setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype,'value').set;
-                setter.call(el, {repr(str(value))});
-                ['input','change','blur'].forEach(function(e){{
-                    el.dispatchEvent(new Event(e,{{bubbles:true}}));
-                }});
-                return true;
-            }})()"""
+        ok = driver.execute_script(
+            """
+            var s = arguments[0], val = arguments[1];
+            var el = document.querySelector(s);
+            if (!el) return false;
+            var setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,'value').set;
+            setter.call(el, val);
+            ['input','change','blur'].forEach(function(e){
+                el.dispatchEvent(new Event(e,{bubbles:true}));
+            });
+            return true;
+            """,
+            matched if matched else sels[0],
+            str(value),
         )
         if ok:
             log.info("  [fill] %-25s = %s", label or matched, value)
             return True
     except Exception:
         pass
-    # fallback: send_keys
+    # fallback: clear then send_keys char by char
     try:
-        await el.send_keys(str(value))
+        driver.execute_script("arguments[0].value = '';", el)
+        el.send_keys(Keys.CONTROL + "a")
+        el.send_keys(Keys.DELETE)
+        for ch in str(value):
+            el.send_keys(ch)
+            time.sleep(random.uniform(0.03, 0.09))
         log.info("  [fill-sk] %-22s = %s", label or matched, value)
         return True
     except Exception as e:
@@ -274,46 +320,135 @@ async def _js_fill(tab, selector: str | list, value: str, label: str = "") -> bo
         return False
 
 
-async def _mat_select(tab, selectors: str | list, text: str, label: str = "") -> bool:
-    """Click a mat-select and choose the option whose text matches `text`."""
+def _fill_date(driver, selectors, value: str, label: str = "") -> bool:
+    """Fill a date picker input. Tries JS native setter first, then direct key entry.
+    VFS date pickers accept DD/MM/YYYY typed directly into the input."""
+    if not value:
+        return False
+    if isinstance(selectors, str):
+        selectors = [selectors]
+    el, matched = _wait(driver, selectors)
+    if not el:
+        log.warning("  [warn] date field not found: %s", label)
+        return False
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        # Try JS setter first
+        ok = driver.execute_script(
+            """
+            var el = arguments[0], val = arguments[1];
+            var setter = Object.getOwnPropertyDescriptor(
+                window.HTMLInputElement.prototype,'value').set;
+            setter.call(el, val);
+            ['input','change','blur'].forEach(function(e){
+                el.dispatchEvent(new Event(e,{bubbles:true}));
+            });
+            return true;
+            """,
+            el, str(value),
+        )
+        if ok:
+            log.info("  [date] %-25s = %s", label, value)
+            return True
+    except Exception:
+        pass
+    # Fallback: click field, select-all, type
+    try:
+        el.click()
+        time.sleep(0.2)
+        el.send_keys(Keys.CONTROL + "a")
+        el.send_keys(Keys.DELETE)
+        el.send_keys(str(value))
+        el.send_keys(Keys.TAB)
+        log.info("  [date-sk] %-23s = %s", label, value)
+        return True
+    except Exception as e:
+        log.error("  [error] date fill %s: %s", label, e)
+        return False
+
+
+def _native_select(driver, selectors, text: str, label: str = "") -> bool:
+    """Handle a plain HTML <select> element by matching visible option text."""
+    if not text:
+        return False
+    if isinstance(selectors, str):
+        selectors = [selectors]
+    el, _ = _wait(driver, selectors, timeout=5)
+    if not el:
+        return False
+    try:
+        from selenium.webdriver.support.ui import Select as SeleniumSelect
+        sel_obj = SeleniumSelect(el)
+        target = text.strip().lower()
+        for opt in sel_obj.options:
+            if opt.text.strip().lower() == target or target in opt.text.strip().lower():
+                sel_obj.select_by_visible_text(opt.text)
+                log.info("  [sel-native] %-22s = %s", label, opt.text)
+                return True
+        log.warning("  [warn] native select no match '%s' for %s", text, label)
+        return False
+    except Exception as e:
+        log.error("  [error] native-select %s: %s", label, e)
+        return False
+
+
+def _mat_select(driver, selectors, text: str, label: str = "") -> bool:
+    """Click a mat-select and choose the option whose text matches `text`.
+    Falls back to native <select> if mat-select is not found."""
     if not text:
         return False
     if isinstance(selectors, str):
         selectors = [selectors]
 
-    el, sel_used = await _wait(tab, selectors)
+    el, sel_used = _wait(driver, selectors)
     if not el:
+        # Try native <select> fallback — swap mat-select prefix for plain select
+        native_sels = [s.replace("mat-select", "select") for s in selectors]
+        if _native_select(driver, native_sels, text, label):
+            return True
         log.warning("  [warn] mat-select not found: %s  (%s)", label, selectors)
         return False
     try:
-        await el.click()
-        # Wait for the overlay panel to populate
+        # If element is a plain <select>, delegate immediately
+        tag = el.tag_name.lower()
+        if tag == "select":
+            return _native_select(driver, [sel_used], text, label)
+
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        el.click()
+        # Wait for overlay panel to populate
         options = []
         deadline = time.monotonic() + DROPDOWN_WAIT
         while time.monotonic() < deadline:
-            options = await tab.find_all("mat-option")
-            if options:
-                break
-            await asyncio.sleep(0.1)
+            try:
+                options = driver.find_elements(By.CSS_SELECTOR, "mat-option")
+                if options:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
 
         target = text.strip().lower()
         for strict in (True, False):
             for opt in options:
                 try:
-                    opt_text = (await opt.get_attribute("innerText") or "").strip()
+                    opt_text = (opt.get_attribute("innerText") or "").strip()
                     match = (opt_text.lower() == target) if strict else (target in opt_text.lower())
                     if match:
-                        await opt.click()
+                        driver.execute_script("arguments[0].click();", opt)
                         log.info("  [sel]  %-25s = %s", label, opt_text)
-                        await asyncio.sleep(0.25)
+                        time.sleep(0.25)
                         return True
-                except Exception:
+                except StaleElementReferenceException:
                     continue
+        available = [opt.get_attribute("innerText") for opt in options[:8]]
         log.warning("  [warn] no option matched '%s' for %s (available: %s)",
-                    text, label, [await o.get_attribute("innerText") for o in options[:8]])
-        # close the overlay by pressing Escape
+                    text, label, available)
+        # Close overlay with Escape
         try:
-            await tab.evaluate("document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))")
+            driver.execute_script(
+                "document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))"
+            )
         except Exception:
             pass
         return False
@@ -322,15 +457,19 @@ async def _mat_select(tab, selectors: str | list, text: str, label: str = "") ->
         return False
 
 
-async def _click(tab, selectors: str | list, label: str = "") -> bool:
+def _click(driver, selectors, label: str = "") -> bool:
     if isinstance(selectors, str):
         selectors = [selectors]
-    el, _ = await _wait(tab, selectors, timeout=10)
+    el, _ = _wait(driver, selectors, timeout=10)
     if not el:
         log.warning("  [warn] button not found: %s", label)
         return False
     try:
-        await el.click()
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        try:
+            el.click()
+        except ElementNotInteractableException:
+            driver.execute_script("arguments[0].click();", el)
         log.info("  [click] %s", label)
         return True
     except Exception as e:
@@ -338,19 +477,19 @@ async def _click(tab, selectors: str | list, label: str = "") -> bool:
         return False
 
 
-async def _current_url(tab) -> str:
+def _current_url(driver) -> str:
     try:
-        return await tab.evaluate("window.location.href") or ""
+        return driver.current_url or ""
     except Exception:
         return ""
 
 
-async def _screenshot(tab, slug: str) -> None:
+def _screenshot(driver, slug: str) -> None:
     try:
         SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%H%M%S")
         path = SCREENSHOTS_DIR / f"{ts}_{slug}.png"
-        await tab.save_screenshot(str(path))
+        driver.save_screenshot(str(path))
         log.info("  [screenshot] %s", path.name)
     except Exception:
         pass
@@ -360,38 +499,42 @@ async def _screenshot(tab, slug: str) -> None:
 # STEP HELPERS
 # ─────────────────────────────────────────────────────────────
 
-async def do_login(tab) -> bool:
+def do_login(driver) -> bool:
     """Navigate to login page and submit credentials."""
     log.info("[Login] Loading login page…")
-    await tab.get(VFS_LOGIN_URL)
-    await _wait_cf(tab)
+    driver.get(VFS_LOGIN_URL)
+    _wait_cf(driver)
 
-    email_el, _ = await _wait(tab, SEL["login_email"])
-    pwd_el, _   = await _wait(tab, SEL["login_password"])
+    email_el, _ = _wait(driver, SEL["login_email"])
+    pwd_el, _   = _wait(driver, SEL["login_password"])
 
     if not email_el or not pwd_el:
         log.error("[Login] Could not find login form fields.")
-        await _screenshot(tab, "login_fail")
+        _screenshot(driver, "login_fail")
         return False
 
     try:
-        await email_el.clear_input()
+        email_el.clear()
     except Exception:
         pass
-    await email_el.send_keys(VFS_USERNAME)
-    await asyncio.sleep(0.3)
+    for ch in VFS_USERNAME:
+        email_el.send_keys(ch)
+        time.sleep(random.uniform(0.03, 0.09))
+    time.sleep(0.3)
 
     try:
-        await pwd_el.clear_input()
+        pwd_el.clear()
     except Exception:
         pass
-    await pwd_el.send_keys(VFS_PASSWORD)
-    await asyncio.sleep(0.3)
+    for ch in VFS_PASSWORD:
+        pwd_el.send_keys(ch)
+        time.sleep(random.uniform(0.03, 0.09))
+    time.sleep(0.3)
 
-    await _click(tab, SEL["login_button"], "login submit")
+    _click(driver, SEL["login_button"], "login submit")
 
     # Wait for dashboard or booking landing
-    post, _ = await _wait(tab, [
+    post, _ = _wait(driver, [
         "app-dashboard", "app-home",
         "[class*='dashboard']",
         "button[class*='new-booking' i]",
@@ -403,17 +546,17 @@ async def do_login(tab) -> bool:
         log.info("[Login] Logged in successfully.")
         return True
 
-    url = await _current_url(tab)
+    url = _current_url(driver)
     if "/login" in url:
         log.error("[Login] Still on login page. Check credentials.")
-        await _screenshot(tab, "login_failed")
+        _screenshot(driver, "login_failed")
         return False
 
     log.info("[Login] Could not confirm dashboard — URL: %s. Continuing anyway.", url)
     return True
 
 
-async def do_step1_appointment_details(tab, client: dict) -> bool:
+def do_step1_appointment_details(driver, client: dict) -> bool:
     """
     Step 1 — /application-detail
     Fill: Application Centre, Appointment Category, Sub-category (+ trip reason if present).
@@ -421,142 +564,139 @@ async def do_step1_appointment_details(tab, client: dict) -> bool:
     """
     log.info("  [Step 1] Appointment Details…")
 
-    # The page should already be open; wait for the centre dropdown
-    centre_el, _ = await _wait(tab, SEL["app_centre"], timeout=ELEMENT_WAIT)
+    centre_el, _ = _wait(driver, SEL["app_centre"], timeout=ELEMENT_WAIT)
     if not centre_el:
-        url = await _current_url(tab)
+        url = _current_url(driver)
         log.error("  [Step 1] Application Centre dropdown not found. URL: %s", url)
-        await _screenshot(tab, "step1_fail")
+        _screenshot(driver, "step1_fail")
         return False
 
-    # Application Centre
-    await _mat_select(tab, SEL["app_centre"],
-                      client.get("application_center", ""), "Application Centre")
-    await asyncio.sleep(0.5)
+    # Skip centre selection if already pre-filled (only 1 centre available)
+    try:
+        current_val = (centre_el.get_attribute("innerText") or "").strip()
+    except Exception:
+        current_val = ""
+    if current_val and "select" not in current_val.lower() and "choose" not in current_val.lower():
+        log.info("  [Step 1] Application Centre already set: %s", current_val)
+    else:
+        _mat_select(driver, SEL["app_centre"],
+                    client.get("application_center", ""), "Application Centre")
+    time.sleep(0.5)
 
-    # Appointment Category (visa_type column maps here)
-    await _mat_select(tab, SEL["appt_category"],
-                      client.get("visa_type", ""), "Appointment Category")
-    await asyncio.sleep(0.5)
+    _mat_select(driver, SEL["appt_category"],
+                client.get("visa_type", ""), "Appointment Category")
+    time.sleep(0.5)
 
-    # Sub-category (service_center column)
-    await _mat_select(tab, SEL["appt_subcategory"],
-                      client.get("service_center", ""), "Sub-category")
-    await asyncio.sleep(0.5)
+    _mat_select(driver, SEL["appt_subcategory"],
+                client.get("service_center", ""), "Sub-category")
+    time.sleep(0.5)
 
-    # Purpose of travel (optional — not always present)
     if client.get("trip_reason"):
-        el, _ = await _wait(tab, SEL["trip_reason"], timeout=3)
+        el, _ = _wait(driver, SEL["trip_reason"], timeout=3)
         if el:
-            await _mat_select(tab, SEL["trip_reason"],
-                              client.get("trip_reason", ""), "Purpose of Travel")
-            await asyncio.sleep(0.3)
+            _mat_select(driver, SEL["trip_reason"],
+                        client.get("trip_reason", ""), "Purpose of Travel")
+            time.sleep(0.3)
 
-    await _screenshot(tab, "step1_filled")
-
-    clicked = await _click(tab, SEL["step1_continue"], "Continue (Step 1)")
-    await asyncio.sleep(STEP_WAIT)
+    _screenshot(driver, "step1_filled")
+    clicked = _click(driver, SEL["step1_continue"], "Continue (Step 1)")
+    time.sleep(STEP_WAIT)
     return clicked
 
 
-async def do_step2_your_details(tab, client: dict) -> bool:
+def do_step2_your_details(driver, client: dict) -> bool:
     """
     Step 2 — /your-details
     Fill all personal info fields and click Continue.
     """
     log.info("  [Step 2] Your Details…")
 
-    # Wait for the first personal-info field
-    first_el, _ = await _wait(tab, SEL["first_name"], timeout=ELEMENT_WAIT)
+    first_el, _ = _wait(driver, SEL["first_name"], timeout=ELEMENT_WAIT)
     if not first_el:
-        url = await _current_url(tab)
+        url = _current_url(driver)
         log.error("  [Step 2] Personal info fields not found. URL: %s", url)
-        await _screenshot(tab, "step2_fail")
+        _screenshot(driver, "step2_fail")
         return False
 
-    dob     = _norm_date(client.get("date_of_birth", ""))
-    expiry  = _norm_date(client.get("passport_expiry", ""))
-    cc      = _norm_code(client.get("mobile_country_code", ""))
+    dob    = _norm_date(client.get("date_of_birth", ""))
+    expiry = _norm_date(client.get("passport_expiry", ""))
+    cc     = _norm_code(client.get("mobile_country_code", ""))
 
-    await _js_fill(tab, SEL["first_name"],         client.get("first_name", ""),    "First Name")
-    await _js_fill(tab, SEL["last_name"],           client.get("last_name", ""),     "Last Name")
-    await _js_fill(tab, SEL["date_of_birth"],       dob,                             "Date of Birth")
-    await _js_fill(tab, SEL["email"],               client.get("email", ""),         "Email")
-    await _js_fill(tab, SEL["mobile_country_code"], cc,                              "Country Code")
-    await _js_fill(tab, SEL["mobile_number"],       client.get("mobile_number", ""), "Mobile Number")
-    await _js_fill(tab, SEL["passport_number"],     client.get("passport_number", ""), "Passport Number")
-    await _js_fill(tab, SEL["passport_expiry"],     expiry,                          "Passport Expiry")
+    _js_fill(driver, SEL["first_name"],         client.get("first_name", ""),    "First Name")
+    _js_fill(driver, SEL["last_name"],           client.get("last_name", ""),     "Last Name")
+    _fill_date(driver, SEL["date_of_birth"],     dob,                             "Date of Birth")
+    _js_fill(driver, SEL["passport_number"],     client.get("passport_number", ""), "Passport Number")
+    _fill_date(driver, SEL["passport_expiry"],   expiry,                          "Passport Expiry")
+    _js_fill(driver, SEL["mobile_country_code"], cc,                              "Country Code")
+    _js_fill(driver, SEL["mobile_number"],       client.get("mobile_number", ""), "Mobile Number")
 
-    await _mat_select(tab, SEL["gender"],
-                      client.get("gender", ""), "Gender")
-    await _mat_select(tab, SEL["current_nationality"],
-                      client.get("current_nationality", ""), "Nationality")
+    _mat_select(driver, SEL["gender"],
+                client.get("gender", ""), "Gender")
+    _mat_select(driver, SEL["current_nationality"],
+                client.get("current_nationality", ""), "Nationality")
 
-    await asyncio.sleep(0.5)
-    await _screenshot(tab, "step2_filled")
-
-    clicked = await _click(tab, SEL["step2_continue"], "Continue (Step 2)")
-    await asyncio.sleep(STEP_WAIT)
+    time.sleep(0.5)
+    _screenshot(driver, "step2_filled")
+    clicked = _click(driver, SEL["step2_continue"], "Continue (Step 2)")
+    time.sleep(STEP_WAIT)
     return clicked
 
 
-async def do_step3_book_appointment(tab) -> bool:
+def do_step3_book_appointment(driver) -> bool:
     """Step 3 — /book-appointment: pick the first available slot."""
     log.info("  [Step 3] Book Appointment slot…")
-    url = await _current_url(tab)
+    url = _current_url(driver)
     log.info("  [Step 3] URL: %s", url)
 
-    # If no slot selector found within timeout, just try to continue
-    slot_el, _ = await _wait(tab, SEL["first_slot"], timeout=15)
+    slot_el, _ = _wait(driver, SEL["first_slot"], timeout=15)
     if slot_el:
         try:
-            await slot_el.click()
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", slot_el)
+            slot_el.click()
             log.info("  [Step 3] Slot selected.")
-            await asyncio.sleep(1)
+            time.sleep(1)
         except Exception as e:
             log.warning("  [Step 3] Could not click slot: %s", e)
     else:
         log.warning("  [Step 3] No available slot element found — form may handle selection differently.")
 
-    await _screenshot(tab, "step3")
-    clicked = await _click(tab, SEL["step3_continue"], "Continue (Step 3)")
-    await asyncio.sleep(STEP_WAIT)
+    _screenshot(driver, "step3")
+    clicked = _click(driver, SEL["step3_continue"], "Continue (Step 3)")
+    time.sleep(STEP_WAIT)
     return clicked
 
 
-async def do_step4_services(tab) -> bool:
+def do_step4_services(driver) -> bool:
     """Step 4 — /services: accept defaults and continue."""
     log.info("  [Step 4] Services…")
-    await asyncio.sleep(2)
-    await _screenshot(tab, "step4")
-    clicked = await _click(tab, SEL["step4_continue"], "Continue (Step 4)")
-    await asyncio.sleep(STEP_WAIT)
+    time.sleep(2)
+    _screenshot(driver, "step4")
+    clicked = _click(driver, SEL["step4_continue"], "Continue (Step 4)")
+    time.sleep(STEP_WAIT)
     return clicked
 
 
-async def do_step5_review_confirm(tab) -> Optional[str]:
+def do_step5_review_confirm(driver) -> Optional[str]:
     """
     Step 5 — /review: click Confirm and grab reference number.
     Returns the booking reference string, or None.
     """
     log.info("  [Step 5] Review & Confirm…")
-    await asyncio.sleep(2)
-    await _screenshot(tab, "step5_review")
+    time.sleep(2)
+    _screenshot(driver, "step5_review")
 
-    await _click(tab, SEL["confirm_button"], "Confirm Booking")
-    await asyncio.sleep(4)   # allow network round-trip
+    _click(driver, SEL["confirm_button"], "Confirm Booking")
+    time.sleep(4)
 
-    await _screenshot(tab, "step5_confirmed")
+    _screenshot(driver, "step5_confirmed")
 
-    # Scrape reference number
     for sel in SEL["confirm_ref"]:
         try:
-            el = await tab.find(sel, timeout=0.5)
-            if el:
-                text = (await el.get_attribute("innerText") or "").strip()
-                if text:
-                    log.info("  [Ref] %s", text)
-                    return text
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            text = (el.get_attribute("innerText") or "").strip()
+            if text:
+                log.info("  [Ref] %s", text)
+                return text
         except Exception:
             continue
     return None
@@ -566,12 +706,74 @@ async def do_step5_review_confirm(tab) -> Optional[str]:
 # PER-CLIENT BOOKING
 # ─────────────────────────────────────────────────────────────
 
-async def book_client(browser, client: dict, idx: int, total: int) -> dict:
+# ─────────────────────────────────────────────────────────────
+# BROWSER LAUNCH
+# ─────────────────────────────────────────────────────────────
+
+def _find_chrome() -> str | None:
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        *glob.glob(os.path.expanduser("~/.cache/selenium/chrome/linux64/*/chrome")),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return (shutil.which("google-chrome")
+            or shutil.which("google-chrome-stable")
+            or shutil.which("chromium")
+            or shutil.which("chromium-browser"))
+
+
+def launch_driver(headless: bool = False, proxy: str = "", profile_dir: str = "") -> uc.Chrome:
+    """Launch an undetected-chromedriver Chrome instance."""
+    options = uc.ChromeOptions()
+    options.add_argument("--window-size=1366,768")
+    options.add_argument("--lang=en-US,en;q=0.9")
+    options.add_argument("--no-first-run")
+    options.add_argument("--no-default-browser-check")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+
+    if profile_dir:
+        os.makedirs(profile_dir, exist_ok=True)
+        options.add_argument(f"--user-data-dir={profile_dir}")
+
+    if proxy:
+        options.add_argument(f"--proxy-server={proxy}")
+        options.add_argument("--proxy-bypass-list=localhost,127.0.0.1")
+        log.info("[Browser] Proxy: %s", proxy)
+
+    chrome_bin = _find_chrome()
+    driver = uc.Chrome(
+        options=options,
+        headless=headless,
+        use_subprocess=True,
+        browser_executable_path=chrome_bin if chrome_bin else None,
+    )
+    driver.set_page_load_timeout(60)
+    driver.implicitly_wait(0)
+    log.info("[Browser] undetected-chromedriver started (headless=%s)", headless)
+    return driver
+
+
+# ─────────────────────────────────────────────────────────────
+# PER-CLIENT BOOKING  (runs in its own thread + browser)
+# ─────────────────────────────────────────────────────────────
+
+def book_client(client: dict, idx: int, total: int,
+                headless: bool = False, proxy: str = "") -> dict:
     """
-    Open a tab, perform login (if needed), navigate the full 5-step form.
+    Launch a dedicated Chrome window, log in, and complete the full 5-step form.
+    Each client runs in its own thread with its own browser instance so all
+    bookings happen in parallel without interfering with each other.
     Returns a result dict.
     """
-    name = f"{client.get('first_name','')} {client.get('last_name','')}".strip()
+    name = f"{client.get('first_name','')  } {client.get('last_name','')}".strip()
     log.info("\n%s", "="*60)
     log.info("[Client %d/%d] %s", idx, total, name)
     log.info("="*60)
@@ -585,130 +787,89 @@ async def book_client(browser, client: dict, idx: int, total: int) -> dict:
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
 
-    tab = await browser.get(VFS_LOGIN_URL, new_tab=(idx > 1))
-    await _wait_cf(tab)
+    # Each client gets an isolated Chrome profile so sessions don't collide
+    profile = os.path.join(CHROME_PROFILE, f"client_{idx}")
+    driver = None
+    try:
+        driver = launch_driver(headless=headless, proxy=proxy, profile_dir=profile)
 
-    # ── Login ────────────────────────────────────────────────
-    url = await _current_url(tab)
-    if "/login" in url or "login" in (await tab.get_title() or "").lower():
-        logged_in = await do_login(tab)
+        # ── Login ────────────────────────────────────────────
+        logged_in = do_login(driver)
         if not logged_in:
             result["error"] = "Login failed"
             return result
-    else:
-        log.info("  [skip] Already logged in.")
 
-    # ── Navigate to booking form ─────────────────────────────
-    # Try to find the "Start New Booking" button on the dashboard
-    await asyncio.sleep(1.5)
-    start_url = await _current_url(tab)
-    log.info("  [nav] Dashboard URL: %s", start_url)
+        # ── Navigate to booking form ─────────────────────────
+        time.sleep(1.5)
+        start_url = _current_url(driver)
+        log.info("  [nav] Dashboard URL: %s", start_url)
 
-    start_btn, _ = await _wait(tab, SEL["start_booking"], timeout=8)
-    if start_btn:
-        log.info("  [nav] Clicking 'Start New Booking'…")
-        try:
-            await start_btn.click()
-        except Exception:
-            await tab.evaluate(
-                "document.querySelector(\"button[class*='new-booking' i], "
-                "button[routerlink*='book' i]\").click()"
-            )
-        await asyncio.sleep(PAGE_NAV_WAIT)
-    else:
-        # Fall back: navigate directly to booking URL
-        log.warning("  [nav] 'Start New Booking' button not found — navigating directly.")
-        await tab.get(VFS_BOOKING_URL)
-        await _wait_cf(tab)
-        await asyncio.sleep(PAGE_NAV_WAIT)
+        # Try CSS selectors, then XPath text-match for the button
+        start_btn, _ = _wait(driver, SEL["start_booking"], timeout=6)
+        if not start_btn:
+            start_btn, _ = _wait_xpath(driver, [
+                "//button[normalize-space()='Start New Booking']",
+                "//button[contains(text(),'Start New Booking')]",
+                "//a[contains(text(),'Start New Booking')]",
+            ], timeout=6)
+        if start_btn:
+            log.info("  [nav] Clicking 'Start New Booking'…")
+            try:
+                driver.execute_script("arguments[0].click();", start_btn)
+            except Exception:
+                pass
+            time.sleep(PAGE_NAV_WAIT)
+        else:
+            log.warning("  [nav] 'Start New Booking' not found — navigating directly.")
+            driver.get(VFS_BOOKING_URL)
+            _wait_cf(driver)
+            time.sleep(PAGE_NAV_WAIT)
 
-    booking_url = await _current_url(tab)
-    log.info("  [nav] Booking URL: %s", booking_url)
+        log.info("  [nav] Booking URL: %s", _current_url(driver))
 
-    # ── Step 1: Appointment Details ──────────────────────────
-    ok = await do_step1_appointment_details(tab, client)
-    if not ok:
-        result["error"] = "Step 1 (Appointment Details) failed"
-        return result
+        # ── Step 1: Appointment Details ──────────────────────
+        ok = do_step1_appointment_details(driver, client)
+        if not ok:
+            result["error"] = "Step 1 (Appointment Details) failed"
+            return result
 
-    # ── Step 2: Your Details ─────────────────────────────────
-    ok = await do_step2_your_details(tab, client)
-    if not ok:
-        result["error"] = "Step 2 (Your Details) failed"
-        return result
+        # ── Step 2: Your Details ─────────────────────────────
+        ok = do_step2_your_details(driver, client)
+        if not ok:
+            result["error"] = "Step 2 (Your Details) failed"
+            return result
 
-    # ── Step 3: Book Appointment ─────────────────────────────
-    await do_step3_book_appointment(tab)
+        # ── Step 3: Book Appointment ─────────────────────────
+        do_step3_book_appointment(driver)
 
-    # ── Step 4: Services ─────────────────────────────────────
-    await do_step4_services(tab)
+        # ── Step 4: Services ─────────────────────────────────
+        do_step4_services(driver)
 
-    # ── Step 5: Review & Confirm ─────────────────────────────
-    ref = await do_step5_review_confirm(tab)
+        # ── Step 5: Review & Confirm ─────────────────────────
+        ref = do_step5_review_confirm(driver)
 
-    if ref:
-        result["status"]    = "BOOKED"
-        result["reference"] = ref
-        log.info("[Client %d] ✓  BOOKED — reference: %s", idx, ref)
-    else:
-        result["status"] = "SUBMITTED"
-        log.info("[Client %d] ✓  Form submitted — no reference text found. Check browser tab.", idx)
+        if ref:
+            result["status"]    = "BOOKED"
+            result["reference"] = ref
+            log.info("[Client %d] ✓  BOOKED — reference: %s", idx, ref)
+        else:
+            result["status"] = "SUBMITTED"
+            log.info("[Client %d] ✓  Form submitted — no reference text found. Check browser.", idx)
+
+        # Keep the window open briefly so the user can verify
+        time.sleep(5)
+
+    except Exception as exc:
+        log.exception("[Client %d] Unhandled error: %s", idx, exc)
+        result["error"] = str(exc)
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
     return result
-
-
-# ─────────────────────────────────────────────────────────────
-# BROWSER LAUNCH
-# ─────────────────────────────────────────────────────────────
-
-def _find_chrome() -> str | None:
-    candidates = [
-        # Windows standard paths
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-        # Linux
-        *glob.glob(os.path.expanduser(
-            "~/.cache/selenium/chrome/linux64/*/chrome"
-        )),
-    ]
-    for p in candidates:
-        if os.path.isfile(p):
-            return p
-    return (shutil.which("google-chrome")
-            or shutil.which("google-chrome-stable")
-            or shutil.which("chromium")
-            or shutil.which("chromium-browser"))
-
-
-async def launch_browser(headless: bool = False, proxy: str = ""):
-    os.makedirs(CHROME_PROFILE, exist_ok=True)
-    chrome_bin = _find_chrome()
-
-    extra_args = [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-infobars",
-        "--window-size=1366,768",
-        f"--user-data-dir={CHROME_PROFILE}",
-        "--lang=en-US,en;q=0.9",
-    ]
-    if proxy:
-        extra_args.append(f"--proxy-server={proxy}")
-        extra_args.append("--proxy-bypass-list=localhost,127.0.0.1")
-        log.info("[Browser] Proxy: %s", proxy)
-
-    kwargs: dict = {
-        "headless": headless,
-        "user_data_dir": CHROME_PROFILE,
-        "browser_args": extra_args,
-    }
-    if chrome_bin:
-        log.info("[Browser] Chrome binary: %s", chrome_bin)
-        kwargs["browser_executable_path"] = chrome_bin
-
-    return await uc.start(**kwargs)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -731,7 +892,7 @@ def save_results(results: list[dict]) -> None:
 # MAIN
 # ─────────────────────────────────────────────────────────────
 
-async def main() -> None:
+def main() -> None:
     ap = argparse.ArgumentParser(
         description="VFS Global Guinea-Bissau → Portugal unified booking bot"
     )
@@ -744,7 +905,7 @@ async def main() -> None:
     ap.add_argument("--headless", action="store_true",
                     help="Run Chrome in headless mode (not recommended — CF blocks this).")
     ap.add_argument("--sequential", action="store_true",
-                    help="Book clients one at a time instead of parallel tabs.")
+                    help="Book clients one at a time instead of launching parallel windows.")
     ap.add_argument("--csv", default=str(CLIENTS_CSV), metavar="PATH",
                     help="Path to clients CSV (default: %(default)s).")
     args = ap.parse_args()
@@ -762,9 +923,6 @@ async def main() -> None:
         log.warning("[Main] No proxy set — if geo-blocked you may receive 403. "
                     "Set via --proxy or VFS_PROXY env var.")
 
-    browser = await launch_browser(headless=args.headless, proxy=args.proxy)
-    first_tab = await browser.get(VFS_LOGIN_URL)
-
     # ── WARMUP MODE ─────────────────────────────────────────
     if args.warmup:
         log.info("\n%s", "="*60)
@@ -776,35 +934,29 @@ async def main() -> None:
         log.info("  3. Navigate to 'Start New Booking' so CF cookies warm up.")
         log.info("  4. Come back here and press ENTER.")
         log.info("="*60)
+        profile = os.path.join(CHROME_PROFILE, "warmup")
+        driver = launch_driver(headless=False, proxy=args.proxy, profile_dir=profile)
+        driver.get(VFS_LOGIN_URL)
+        _wait_cf(driver)
         try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, input, "  >>> Press ENTER once done: ")
+            input("  >>> Press ENTER once done: ")
         except EOFError:
-            await asyncio.sleep(20)
-
-        # Navigate to booking URL to cache CF cookie
+            time.sleep(20)
         log.info("[Warmup] Warming booking page…")
-        warm_tab = await browser.get(VFS_BOOKING_URL, new_tab=True)
-        ok, _ = await _wait(warm_tab, SEL["app_centre"], timeout=60)
-        if ok:
+        driver.get(VFS_BOOKING_URL)
+        _wait_cf(driver)
+        el, _ = _wait(driver, SEL["app_centre"], timeout=60)
+        if el:
             log.info("[Warmup] ✓ Booking form loaded — session warmed.")
         else:
-            stuck = await _current_url(warm_tab)
-            log.warning("[Warmup] ✗ Booking form did NOT load. Stuck at: %s", stuck)
-            log.info("[Warmup]   Cookies may still be partially saved. Try running without --warmup.")
-        await asyncio.sleep(3)
+            log.warning("[Warmup] ✗ Booking form did NOT load. Stuck at: %s", _current_url(driver))
+        time.sleep(3)
+        driver.quit()
         log.info("[Warmup] Profile saved to: %s", CHROME_PROFILE)
         log.info("[Warmup] Run without --warmup when the booking window opens.")
         return
 
     # ── BOOKING MODE ─────────────────────────────────────────
-    # Log in on the first tab to establish a shared session
-    logged_in = await do_login(first_tab)
-    if not logged_in:
-        log.error("[Main] Login failed. Leaving browser open for 60s — solve CF manually then re-run.")
-        await asyncio.sleep(60)
-        return
-
     log.info("\n[Main] Starting %d booking(s)  [mode: %s]…",
              len(clients), "sequential" if args.sequential else "parallel")
     t0 = time.monotonic()
@@ -812,14 +964,28 @@ async def main() -> None:
 
     if args.sequential:
         for i, client in enumerate(clients, start=1):
-            r = await book_client(browser, client, i, len(clients))
+            r = book_client(client, i, len(clients),
+                            headless=args.headless, proxy=args.proxy)
             results.append(r)
     else:
-        tasks = [
-            book_client(browser, client, i, len(clients))
-            for i, client in enumerate(clients, start=1)
-        ]
-        results = list(await asyncio.gather(*tasks, return_exceptions=False))
+        # Each client gets its own thread and its own Chrome window
+        with ThreadPoolExecutor(max_workers=len(clients)) as pool:
+            futures = {
+                pool.submit(book_client, client, i, len(clients),
+                            args.headless, args.proxy): i
+                for i, client in enumerate(clients, start=1)
+            }
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    idx = futures[future]
+                    log.error("[Client %d] Thread raised: %s", idx, exc)
+                    results.append({
+                        "name": f"Client {idx}", "email": "", "status": "FAILED",
+                        "reference": "", "error": str(exc),
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    })
 
     elapsed = time.monotonic() - t0
     log.info("\n[Main] All %d client(s) done in %.1fs.", len(clients), elapsed)
@@ -827,18 +993,12 @@ async def main() -> None:
     # ── Summary ──────────────────────────────────────────────
     log.info("\n%s  RESULTS  %s", "─"*25, "─"*25)
     for r in results:
-        log.info("  %-30s  %-10s  %s", r["name"], r["status"], r.get("reference", r.get("error", "")))
+        log.info("  %-30s  %-10s  %s", r["name"], r["status"],
+                 r.get("reference", r.get("error", "")))
     log.info("─"*61)
 
     save_results(results)
 
-    log.info("\n[Main] Browser stays open for review — press Ctrl+C to exit.")
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        log.info("[Main] Exiting.")
-
 
 if __name__ == "__main__":
-    uc.loop().run_until_complete(main())
+    main()

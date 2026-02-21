@@ -27,16 +27,21 @@ call .venv\Scripts\activate.bat
 REM Install / update dependencies
 echo Installing dependencies...
 pip install setuptools --quiet
-pip install undetected-chromedriver selenium requests --quiet
+pip install undetected-chromedriver selenium pandas requests --quiet
 if errorlevel 1 ( echo ERROR: pip install failed. & pause & exit /b 1 )
 
 echo.
 echo Starting booking script...
 echo.
 
-REM Run the booking script (visible browser by default)
-REM Add --headless to hide the browser window
-python run_booking.py %*
+REM Run the unified booking script (multi-client, nodriver-based)
+REM Useful flags:
+REM   --warmup              warm Cloudflare session before booking window opens
+REM   --headless            hide browser (not recommended, CF may block)
+REM   --sequential          book one client at a time
+REM   --max-clients N       limit number of clients
+REM   --csv path/to/file    use a different clients CSV
+python unified_booking.py %*
 
 echo.
 echo Booking script finished.
